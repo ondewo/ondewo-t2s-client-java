@@ -115,11 +115,10 @@ ls src/main/java/ondewo/t2s/*Grpc.java
 A minimal call, with the bearer token ONDEWO servers expect attached to every request:
 
 ```java
-import io.grpc.CallCredentials;
+import com.ondewo.t2s.auth.BearerToken;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-import io.grpc.Metadata;
-import io.grpc.stub.MetadataUtils;
+import ondewo.t2s.Text2SpeechGrpc;
 
 String host = System.getenv("ONDEWO_HOST");
 int port = Integer.parseInt(System.getenv("ONDEWO_PORT"));
@@ -130,21 +129,22 @@ ManagedChannel channel = ManagedChannelBuilder
     .useTransportSecurity()   // .usePlaintext() for a local, unencrypted server
     .build();
 
-Metadata headers = new Metadata();
-headers.put(Metadata.Key.of("authorization", Metadata.ASCII_STRING_MARSHALLER), "Bearer " + accessToken);
-
-// Replace <Service> with one of the services declared in the ondewo-t2s-api protos.
-<Service>Grpc.<Service>BlockingStub stub = <Service>Grpc
-    .newBlockingStub(channel)
-    .withInterceptors(MetadataUtils.newAttachHeadersInterceptor(headers));
+Text2SpeechGrpc.Text2SpeechBlockingStub stub = new BearerToken(accessToken)
+    .attachTo(Text2SpeechGrpc.newBlockingStub(channel));
 
 // ... issue requests through `stub`, then shut the channel down:
 channel.shutdownNow();
 ```
 
-Note that the protos do not set `java_multiple_files`, so messages are nested inside the outer
-class protoc names after the proto file (`entity_type.proto` → `EntityTypeProto`,
-`agent.proto` → `Agent` or `AgentOuterClass` when a message of the same name exists).
+`BearerToken` is the one hand-written class of this client (see
+[Hand-written code beside the stubs](#hand-written-code-beside-the-stubs)); it wraps the
+`authorization: Bearer <token>` header every ONDEWO server expects. Attaching the header by hand
+with `MetadataUtils.newAttachHeadersInterceptor(...)` works just as well.
+
+Note that the protos do not set `java_multiple_files`, so every message is nested inside
+the outer class protoc names after the proto file: `ondewo/t2s/text-to-speech.proto` →
+`ondewo.t2s.TextToSpeech`. No `com.ondewo.t2s` classes are generated, which is why the
+hand-written `BearerToken` can live there without ever colliding with the generator.
 
 ## Repository structure
 
@@ -228,11 +228,28 @@ a regeneration as long as they live in their own package (for example
 ## Testing
 
 ```bash
-make test
+make test          # check_build + mvn verify (suite + coverage gate)
+mvn -B verify      # the same without the submodule-dependent check_build
 ```
 
-runs `check_build` (every proto produced java code) and then `mvn test`. The same two steps run
-in CI for JDK 11 and JDK 21 on every push — see `.github/workflows/ci.yml`.
+The JUnit 5 suite under `src/test/java` exercises the **committed** stubs — it never builds the
+compiler image and never runs protoc:
+
+| Test class | What it proves |
+| --- | --- |
+| `com.ondewo.t2s.stubs.GeneratedMessagesTest` | messages nested in the outer class `ondewo.t2s.TextToSpeech` survive a serialize/parse round trip, the `optional string instruction` of `RequestConfig` keeps explicit presence on the wire, every enum starts at its declared zero value, and the proto package in the descriptor is untouched by the `java_package` rewrite |
+| `com.ondewo.t2s.stubs.GeneratedServicesTest` | the generated `Text2SpeechGrpc` class (found on the compiled classpath, not listed by hand) exposes a usable `ServiceDescriptor`, `StreamingSynthesize` stays bidirectionally streaming, a unary `NormalizeText` call runs end to end over the in-process transport and the real generated marshallers, and all three stub flavours build against a plain target channel |
+| `com.ondewo.t2s.auth.BearerTokenTest` | the hand-written `BearerToken` — validation, header shape, stub immutability |
+
+Coverage is measured with **JaCoCo over the hand-written sources only**
+(`com/ondewo/t2s/auth/**`). Generated stubs are machine output and are excluded from the metric,
+but they are exercised by the two test classes above. The gate is bound to `verify` and fails the
+build below **100 %** instruction, branch and method coverage; the HTML report lands in
+`target/site/jacoco/`.
+
+CI runs the whole thing on `ubuntu-latest` for JDK 11 and JDK 21 on every push and pull request
+— see `.github/workflows/ci.yml`. No step is conditional: a missing or truncated client turns the
+run red instead of skipping.
 
 ## Release
 
