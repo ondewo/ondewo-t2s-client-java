@@ -10,7 +10,7 @@
   is generated from the protobuf definitions of [ondewo-t2s-api](https://github.com/ondewo/ondewo-t2s-api)
   by the `ondewo-java-proto-compiler` image of the
   [ONDEWO proto compiler](https://github.com/ondewo/ondewo-proto-compiler) release
-  `5.15.0`: `protoc --java_out` for the message classes, `protoc-gen-grpc-java` for the
+  `5.15.1`: `protoc --java_out` for the message classes, `protoc-gen-grpc-java` for the
   service stubs, and a rendered `pom.xml` that pins the gRPC, protobuf and
   `proto-google-common-protos` versions the stubs were generated against. The packaged artifact is
   `com.ondewo:ondewo-t2s-client-java`, compiled with `maven.compiler.release=11`, and ships a
