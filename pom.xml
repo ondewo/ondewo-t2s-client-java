@@ -32,7 +32,7 @@
 
   <groupId>com.ondewo</groupId>
   <artifactId>ondewo-t2s-client-java</artifactId>
-  <version>6.6.0</version>
+  <version>6.6.1</version>
   <packaging>jar</packaging>
 
   <name>ondewo-t2s-client-java</name>
