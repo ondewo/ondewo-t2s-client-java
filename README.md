@@ -171,6 +171,62 @@ channel.shutdownNow();
 `authorization: Bearer <token>` header every ONDEWO server expects. Attaching the header by hand
 with `MetadataUtils.newAttachHeadersInterceptor(...)` works just as well.
 
+### Keycloak: password or offline token
+
+Against a Keycloak-protected ONDEWO server, let the client fetch and refresh the token itself.
+Set the Keycloak fields on `ClientConfig` and every call on the channel carries
+`authorization: Bearer <token>` from one shared `KeycloakTokenProvider` per credential set:
+
+```java
+// Technical user + password: one password grant (scope=offline_access) at start-up.
+ClientConfig withPassword = ClientConfig.builder().host(host).port(port)
+    .keycloakUrl("https://keycloak.example.com/auth")   // the part before /realms/<realm>
+    .realm("ondewo-ccai-platform")
+    .clientId("ondewo-t2s-cai-sdk-public")              // public client, no secret
+    .username("technical-user@example.com")
+    .password(System.getenv("ONDEWO_PASSWORD"))
+    .build();
+
+// A handed-off OFFLINE refresh token instead: the start-up is a refresh grant and the
+// password is never sent, not even as a fallback.
+ClientConfig withOfflineToken = ClientConfig.builder().host(host).port(port)
+    .keycloakUrl("https://keycloak.example.com/auth")
+    .realm("ondewo-ccai-platform")
+    .clientId("ondewo-t2s-cai-sdk-public")
+    .username("technical-user@example.com")
+    .refreshToken(System.getenv("ONDEWO_OFFLINE_TOKEN"))
+    .tokenExpirationInS(null)          // optional bound of the auto-refresh, in seconds
+    .keycloakVerifySsl(true)           // false only for a self-signed local ingress
+    .build();
+
+ManagedChannel channel = GrpcChannels.newChannel(withOfflineToken);  // logs in once, here
+```
+
+`keycloakUrl`, `realm` and `clientId` are all set or all empty (empty = no `authorization`
+header at all), and a Keycloak config needs `password` or `refreshToken`. Opening the first
+channel of a credential set performs the start-up token request, so it can throw
+`KeycloakAuthenticationException`.
+
+The provider refreshes the access token 30 s before it expires, from a daemon thread
+`keycloak-token-refresh-<clientId>` and lazily on every call. A failed refresh never stops the
+refresh and is never answered with a password login: it backs off with full jitter from 5 s up to
+300 s, shared by the thread and every call, so an outage costs one token request per backoff step.
+A still-valid token keeps being served meanwhile; only an expired one fails the call with
+`UNAUTHENTICATED`, carrying the `KeycloakAuthenticationException` as its cause. Without a channel
+from `GrpcChannels`, use the provider directly:
+
+```java
+KeycloakTokenProvider tokens = KeycloakTokenProvider.shared(new KeycloakCredentials(
+    keycloakUrl, realm, clientId, username, "", null, true, offlineRefreshToken));
+<Service>Grpc.<Service>BlockingStub stub = tokens.attachTo(<Service>Grpc.newBlockingStub(channel));
+// or channel-wide: ManagedChannelBuilder.intercept(tokens.toInterceptor())
+tokens.close();   // stops the refresh thread; an unreachable provider stops it by itself
+```
+
+The behaviour, constants, log lines and error messages are the same in every ONDEWO client SDK.
+Neither `toString()` nor an error message nor a log line renders the password, the refresh token or
+an access token.
+
 Note that the protos do not set `java_multiple_files`, so every message is nested inside
 the outer class protoc names after the proto file: `ondewo/t2s/text-to-speech.proto` →
 `ondewo.t2s.TextToSpeech`. No `com.ondewo.t2s` classes are generated, which is why the
@@ -298,6 +354,9 @@ builds the same PKI in memory at test time (`TestPki`), so no key is ever commit
 * `ClientConfig` has no serialized form. Keep the key out of configuration files and source
   control; load it from a file with mode `0600` or a secret store at startup.
 * `BearerToken` keeps the access token in memory only and does not render it in `toString()`.
+* `ClientConfig.toString()` and `KeycloakCredentials.toString()` show `password` and
+  `refreshToken` as `***REDACTED***` (empty when unset). `keycloakVerifySsl(false)` skips the
+  certificate and host name check of the token-endpoint call only; nothing JVM-wide is changed.
 
 ### TLS troubleshooting
 
@@ -407,7 +466,8 @@ a regeneration as long as they live in their own package (for example
 
 * Never put a hand-written class in a package that holds generated stubs — it is deleted on the
   next run.
-* Hand-written code compiles against `pom.xml`, which declares gRPC, protobuf and nothing else at
+* Hand-written code compiles against `pom.xml`, which declares gRPC, protobuf, gson (the JSON of the
+  Keycloak token endpoint, already a runtime dependency of grpc-core) and nothing else at
   runtime (`java.net.http` covers HTTP/token work). An extra dependency goes into `pom.xml`, which
   a regeneration keeps; the image's own offline build compiles the generated stubs only.
 
@@ -427,6 +487,9 @@ compiler image and never runs protoc:
 | `com.ondewo.t2s.stubs.GeneratedMessagesTest` | messages nested in the outer class `ondewo.t2s.TextToSpeech` survive a serialize/parse round trip, the `optional string instruction` of `RequestConfig` keeps explicit presence on the wire, every enum starts at its declared zero value, and the proto package in the descriptor is untouched by the `java_package` rewrite |
 | `com.ondewo.t2s.stubs.GeneratedServicesTest` | the generated `Text2SpeechGrpc` class (found on the compiled classpath, not listed by hand) exposes a usable `ServiceDescriptor`, `StreamingSynthesize` stays bidirectionally streaming, a unary `NormalizeText` call runs end to end over the in-process transport and the real generated marshallers, and all three stub flavours build against a plain target channel |
 | `com.ondewo.t2s.auth.BearerTokenTest` | the hand-written `BearerToken` — validation, header shape, stub immutability |
+| `com.ondewo.t2s.auth.KeycloakTokenProviderTest` | the cross-SDK Keycloak catalogue (T01-T47) on a fake token endpoint, fake clock and scripted stop signal: the backoff ladder, a background refresh that survives every failure kind, the shared backoff of the lazy path, 16 concurrent callers during an outage sending one request, response validation, no credential in a log or an error, `close()` from any state, a real refresh thread that recovers, and the offline-token start-up that never sends a password |
+| `com.ondewo.t2s.auth.KeycloakTokenProviderRegistryTest` / `KeycloakCredentialsTest` | one provider per credential set keyed by a SHA-256 of the credentials (T48-T54), validation and redaction of `KeycloakCredentials` |
+| `com.ondewo.t2s.auth.HttpClientTokenEndpointTest` / `KeycloakCallCredentialsTest` | the real `java.net.http` transport against a loopback HTTP(S) server (form encoding, timeout, refused connection, `keycloakVerifySsl`), and the `authorization: Bearer` header reaching a server through the interceptor, `attachTo` and the call credentials |
 | `com.ondewo.t2s.channel.ClientConfigTest` | `ClientConfig` validation (host, port, both-or-neither client identity, no identity on plaintext), IPv6 target bracketing, and that neither an error message nor `toString()` renders a PEM or the key |
 | `com.ondewo.t2s.channel.GrpcChannelsTest` | real TLS handshakes against a Netty server on a loopback socket with a PKI generated at test time: TLS with a custom CA, mutual TLS (the server sees the client certificate), CRLF PEMs, IPv6 `[::1]`, empty identity = plain TLS; refused handshakes (no client certificate, client from an unrelated CA, wrong CA, JVM trust store against a test CA) end in `UNAVAILABLE`; plaintext logs a warning naming `host:port`; non-PEM material is refused without being echoed |
 | `com.ondewo.t2s.release.ReleaseNotesTest` | every `RELEASE.md` heading uses the spelling `CURRENT_RELEASE_NOTES` slices, every section ends at its `*****` separator, and the current version has non-empty notes - so a GitHub release is never published without a body |
